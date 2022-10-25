@@ -85,5 +85,7 @@ namespace VaultSharp
         /// See <see cref="V1.SecretsEngines.SecretsEngineMountPoints.Defaults" /> for defaults.
         /// </summary>
         public SecretsEngineMountPoints SecretsEngineMountPoints { get; set; } = new SecretsEngineMountPoints();
+        
+        public int Retries { get; set; }
     }
 }

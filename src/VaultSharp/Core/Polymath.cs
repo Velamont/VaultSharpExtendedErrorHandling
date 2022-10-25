@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Http;
@@ -30,7 +31,10 @@ namespace VaultSharp.Core
         private readonly IAuthMethodLoginProvider _authMethodLoginProvider;
 
         public VaultClientSettings VaultClientSettings { get; }
-
+        
+        private int _retryCounter;
+        private TimeSpan _delay = new TimeSpan(0);
+        
         public Polymath(VaultClientSettings vaultClientSettings)
         {
             VaultClientSettings = vaultClientSettings;
@@ -91,6 +95,7 @@ namespace VaultSharp.Core
 
             vaultClientSettings.PostProcessHttpClientHandlerAction?.Invoke(handler);
 
+            _retryCounter = VaultClientSettings.Retries;
             _httpClient = VaultClientSettings.MyHttpClientProviderFunc == null ? new HttpClient(handler) : VaultClientSettings.MyHttpClientProviderFunc(handler);
 
             _httpClient.BaseAddress = new Uri(VaultClientSettings.VaultServerUriWithPort);
@@ -191,8 +196,8 @@ namespace VaultSharp.Core
         }
 
         /// //////
-
-        protected async Task<TResponse> MakeRequestAsync<TResponse>(string resourcePath, HttpMethod httpMethod, object requestData = null, IDictionary<string, string> headers = null, bool rawResponse = false, Action<HttpResponseMessage> postResponseAction = null) where TResponse : class
+        
+        private async Task<TResponse> MakeRequestAsync<TResponse>(string resourcePath, HttpMethod httpMethod, object requestData = null, IDictionary<string, string> headers = null, bool rawResponse = false, Action<HttpResponseMessage> postResponseAction = null) where TResponse : class
         {
             try
             {
@@ -253,11 +258,17 @@ namespace VaultSharp.Core
                         httpRequestMessage.Headers.Add(kv.Key, kv.Value);
                     }
                 }
-
+                
                 VaultClientSettings.BeforeApiRequestAction?.Invoke(_httpClient, httpRequestMessage);
 
                 var httpResponseMessage = await _httpClient.SendAsync(httpRequestMessage).ConfigureAwait(VaultClientSettings.ContinueAsyncTasksOnCapturedContext);
 
+                if (httpResponseMessage.Headers.Contains("Retry-After"))
+                {
+                    Debug.Assert(httpResponseMessage.Headers.RetryAfter.Delta != null, "httpResponseMessage.Headers.RetryAfter.Delta != null");
+                    _delay = httpResponseMessage.Headers.RetryAfter.Delta.Value;
+                }
+                
                 // internal delegate.
                 postResponseAction?.Invoke(httpResponseMessage);
 
@@ -278,13 +289,28 @@ namespace VaultSharp.Core
                     return default(TResponse);
                 }
 
+
+                if (ResponseNeedsRetry(httpResponseMessage))
+                {
+                    await Task.Delay(_delay);
+                    await MakeRequestAsync<TResponse>(resourcePath, httpMethod, requestData, headers, rawResponse, postResponseAction).ConfigureAwait(VaultClientSettings.ContinueAsyncTasksOnCapturedContext);
+                    _retryCounter--;
+                }
+                
                 throw new VaultApiException(httpResponseMessage.StatusCode, responseText);
             }
-            catch (WebException ex)
+            catch (WebException we)
             {
-                if (ex.Status == WebExceptionStatus.ProtocolError)
+                if (_retryCounter >= 0 && we.Status == WebExceptionStatus.ProtocolError)
                 {
-                    if (ex.Response is HttpWebResponse response)
+                    await Task.Delay(_delay);
+                    await MakeRequestAsync<TResponse>(resourcePath, httpMethod, requestData, headers, rawResponse, postResponseAction).ConfigureAwait(VaultClientSettings.ContinueAsyncTasksOnCapturedContext);
+                    _retryCounter--;
+                }
+
+                if (we.Status == WebExceptionStatus.ProtocolError)
+                {
+                    if (we.Response is HttpWebResponse response)
                     {
                         string responseText;
 
@@ -302,6 +328,12 @@ namespace VaultSharp.Core
 
                 throw;
             }
+        }
+
+        private bool ResponseNeedsRetry(HttpResponseMessage httpResponseMessage)
+        {
+            return _retryCounter >= 0 && httpResponseMessage.StatusCode == HttpStatusCode.TemporaryRedirect || httpResponseMessage.StatusCode == HttpStatusCode.RequestTimeout ||
+                   httpResponseMessage.StatusCode == HttpStatusCode.BadRequest || httpResponseMessage.StatusCode == HttpStatusCode.ResetContent;
         }
     }
 }

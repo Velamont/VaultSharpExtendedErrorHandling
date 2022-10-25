@@ -1336,6 +1336,10 @@ namespace VaultSharp.Samples
                 },
                 Namespace = "bhjk",
                 MyHttpClientProviderFunc = handler => new HttpClient(handler)
+                {
+                    Timeout = new TimeSpan(30)
+                },
+                Retries = 3
             };
 
             return settings;
